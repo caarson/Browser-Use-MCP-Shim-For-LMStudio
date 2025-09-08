@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -7,7 +7,27 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import uvicorn
 
-LMSTUDIO_BASE = os.getenv("LMSTUDIO_BASE", "http://127.0.0.1:1234/v1")
+# Mutable base URL so a GUI or caller can override prior to launching the server.
+LMSTUDIO_BASE: str = os.getenv("LMSTUDIO_BASE", "http://127.0.0.1:1234/v1")
+
+def set_lmstudio_base(base_url: str) -> str:
+    """Update the base URL used to reach the upstream LM Studio server.
+
+    Accepts values with or without trailing /v1 and with or without trailing slash.
+    Returns the normalized URL actually stored.
+    """
+    global LMSTUDIO_BASE
+    if not base_url:
+        raise ValueError("base_url must be non-empty")
+    b = base_url.strip()
+    if not (b.startswith("http://") or b.startswith("https://")):
+        b = "http://" + b
+    # Remove any trailing slashes then ensure single /v1 suffix
+    b = b.rstrip("/")
+    if not b.endswith("/v1"):
+        b = b + "/v1"
+    LMSTUDIO_BASE = b
+    return LMSTUDIO_BASE
 
 app = FastAPI()
 
