@@ -11,7 +11,7 @@ pip install -r requirements.txt
 Run the shim server directly (default host 127.0.0.1:8088 pointing to LM Studio at 127.0.0.1:1234):
 
 ```
-python lmstudio_toolchoice_shim.py
+python main.py
 ```
 
 ## GUI Launcher
