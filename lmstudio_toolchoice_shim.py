@@ -1,10 +1,10 @@
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from urllib.parse import urljoin
-
+import json
+import logging
 import requests
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
 import uvicorn
 
 # Mutable base URL so a GUI or caller can override prior to launching the server.
@@ -29,6 +29,9 @@ def set_lmstudio_base(base_url: str) -> str:
     LMSTUDIO_BASE = b
     return LMSTUDIO_BASE
 
+logging.basicConfig(level=logging.INFO, format="[shim] %(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("lmstudio_shim")
+
 app = FastAPI()
 
 def _massage_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,18 +48,64 @@ def _massage_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Fallback to plain text if schema is not supported
         payload["response_format"] = {"type": "text"}
 
+    # Always explicitly set stream false per requirements
+    payload["stream"] = False
+
     return payload
 
 def _proxy(method: str, path: str, body: Any = None, headers: Dict[str, str] = None) -> Response:
-    url = urljoin(LMSTUDIO_BASE + "/", path.lstrip("/"))
-    # Strip hop-by-hop headers and set JSON content type if needed
-    out_headers = {"Content-Type": "application/json"}
+    # Avoid duplicating /v1 when both base already ends with /v1 and path begins with v1/
+    rel = path.lstrip("/")
+    if LMSTUDIO_BASE.rstrip("/").endswith("/v1") and rel.startswith("v1/"):
+        rel = rel[3:]  # drop leading 'v1/' so base/v1 + rel -> base/v1/<rest>
+    url = urljoin(LMSTUDIO_BASE.rstrip("/") + "/", rel)
+    # Preserve auth / cookie headers, normalize others
+    out_headers: Dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
     if headers:
-        out_headers.update({k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")})
+        for k, v in headers.items():
+            kl = k.lower()
+            if kl in ("host", "content-length"):
+                continue
+            # Pass through Authorization, Cookie, etc.
+            if kl in ("authorization", "cookie"):
+                out_headers[k] = v
+    try:
+        logger.info(f"-> {method} {path} upstream={url} body_keys={list(body.keys()) if isinstance(body, dict) else 'raw'}")
+    except Exception:
+        logger.info(f"-> {method} {path} upstream={url}")
+
     resp = requests.request(method, url, json=body, headers=out_headers, timeout=600)
-    # Pass through JSON or raw bytes
+
+    raw = resp.content
     content_type = resp.headers.get("Content-Type", "application/json")
-    return Response(content=resp.content, status_code=resp.status_code, media_type=content_type)
+
+    # Try to ensure UTF-8 JSON. If JSON parse fails, return raw.
+    processed_bytes = raw
+    if "application/json" in content_type.lower():
+        text = None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("cp1252")
+                logger.warning("Decoded upstream response with cp1252 fallback")
+            except Exception:
+                text = None
+        if text is not None:
+            # Validate JSON structure
+            try:
+                parsed = json.loads(text)
+                processed_bytes = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON: {e}; returning raw bytes")
+
+    preview = processed_bytes[:200]
+    try:
+        logger.info(f"<- {resp.status_code} bytes={len(processed_bytes)} preview={preview.decode('utf-8','ignore')}")
+    except Exception:
+        logger.info(f"<- {resp.status_code} bytes={len(processed_bytes)} (preview decode failed)")
+
+    return Response(content=processed_bytes, status_code=resp.status_code, media_type="application/json")
 
 @app.get("/v1/models")
 def models():
