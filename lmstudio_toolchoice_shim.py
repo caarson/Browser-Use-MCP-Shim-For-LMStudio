@@ -4,7 +4,9 @@ from urllib.parse import urljoin
 import json
 import logging
 import requests
+from requests import Timeout as RequestsTimeout
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # Mutable base URL so a GUI or caller can override prior to launching the server.
@@ -53,12 +55,19 @@ def _massage_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return payload
 
+def _normalize_path(in_path: str) -> str:
+    rel = in_path.lstrip("/")
+    # Accept bare chat/completions or with v1/
+    if rel.startswith("v1/"):
+        rel = rel[3:]
+    # Ensure we only ever forward paths under v1
+    return f"v1/{rel}" if not rel.startswith("v1/") else rel
+
 def _proxy(method: str, path: str, body: Any = None, headers: Dict[str, str] = None) -> Response:
-    # Avoid duplicating /v1 when both base already ends with /v1 and path begins with v1/
-    rel = path.lstrip("/")
-    if LMSTUDIO_BASE.rstrip("/").endswith("/v1") and rel.startswith("v1/"):
-        rel = rel[3:]  # drop leading 'v1/' so base/v1 + rel -> base/v1/<rest>
-    url = urljoin(LMSTUDIO_BASE.rstrip("/") + "/", rel)
+    norm = _normalize_path(path)
+    # Build final upstream URL (LMSTUDIO_BASE already ends with /v1)
+    suffix = norm[3:] if norm.startswith("v1/") else norm
+    url = urljoin(LMSTUDIO_BASE.rstrip("/") + "/", suffix.lstrip("/"))
     # Preserve auth / cookie headers, normalize others
     out_headers: Dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
     if headers:
@@ -70,11 +79,15 @@ def _proxy(method: str, path: str, body: Any = None, headers: Dict[str, str] = N
             if kl in ("authorization", "cookie"):
                 out_headers[k] = v
     try:
-        logger.info(f"-> {method} {path} upstream={url} body_keys={list(body.keys()) if isinstance(body, dict) else 'raw'}")
+        logger.info(f"-> {method} in={path} norm=/{norm} upstream={url} body_keys={list(body.keys()) if isinstance(body, dict) else 'raw'}")
     except Exception:
-        logger.info(f"-> {method} {path} upstream={url}")
+        logger.info(f"-> {method} in={path} norm=/{norm} upstream={url}")
 
-    resp = requests.request(method, url, json=body, headers=out_headers, timeout=600)
+    try:
+        resp = requests.request(method, url, json=body, headers=out_headers, timeout=600)
+    except RequestsTimeout:
+        logger.error(f"<- 504 timeout upstream after 600s {url}")
+        return JSONResponse(status_code=504, content={"error": {"message": "Upstream timeout", "type": "timeout"}})
 
     raw = resp.content
     content_type = resp.headers.get("Content-Type", "application/json")
@@ -117,7 +130,18 @@ async def chat_completions(req: Request):
     payload = _massage_chat_payload(payload)
     return _proxy("POST", "/v1/chat/completions", body=payload, headers=dict(req.headers))
 
+# Also accept calls without /v1 prefix for convenience
+@app.post("/chat/completions")
+async def chat_completions_short(req: Request):
+    payload = await req.json()
+    payload = _massage_chat_payload(payload)
+    return _proxy("POST", "/chat/completions", body=payload, headers=dict(req.headers))
+
 # Generic passthroughs if you ever need them
+@app.get("/health")
+def health():
+    return _proxy("GET", "/v1/models")
+
 @app.get("/{full_path:path}")
 def passthrough_get(full_path: str):
     return _proxy("GET", f"/{full_path}")
