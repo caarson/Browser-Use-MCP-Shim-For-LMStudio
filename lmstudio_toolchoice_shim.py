@@ -231,6 +231,19 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
                 return data
         return obj if isinstance(obj, dict) else {}
 
+    def _compute_preview() -> tuple[str, str]:
+        """Return (preview_text, source) where source is 'content' or 'tool_args'."""
+        if acc_content_parts:
+            pv = "".join(acc_content_parts)[-200:]
+            return pv, "content"
+        # fallback: last tool_call arguments tail
+        for tc in reversed(acc_tool_calls):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str) and args:
+                return args[-200:], "tool_args"
+        return "", "content"
+
     try:
         line_iter = resp.iter_lines(decode_unicode=False)
         event_data_parts: List[bytes] = []
@@ -300,8 +313,8 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
                                                 pass
                                     except Exception as e:
                                         logger.warning(f"Failed to merge tool_call entry: {e}")
-                        preview = "".join(acc_content_parts)[-200:]
-                        logger.info(f"[SSE] chunks={chunk_count} preview={preview.encode('utf-8','ignore')[:200].decode('utf-8','ignore')}")
+                        preview, src = _compute_preview()
+                        logger.info(f"[SSE] chunks={chunk_count} preview({src})={preview.encode('utf-8','ignore')[:200].decode('utf-8','ignore')}")
                     except Exception as e:
                         logger.warning(f"SSE buffered JSON parse failed at EOF: {e}")
                 break
@@ -381,8 +394,8 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
 
                     now = time.time()
                     if now - last_log >= 2.0:
-                        preview = "".join(acc_content_parts)[-200:]
-                        logger.info(f"[SSE] chunks={chunk_count} preview={preview.encode('utf-8','ignore')[:200].decode('utf-8','ignore')}")
+                        preview, src = _compute_preview()
+                        logger.info(f"[SSE] chunks={chunk_count} preview({src})={preview.encode('utf-8','ignore')[:200].decode('utf-8','ignore')}")
                         last_log = now
                 continue
 
@@ -430,8 +443,17 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
     }
 
     # Final log
-    preview = (msg.get("content") or "")[:200]
-    logger.info(f"[SSE] complete chunks={chunk_count} finish_reason={finish_reason or 'stop'} preview={preview}")
+    ptext, psrc = (msg.get("content") or "")[:200], "content"
+    if not ptext and msg.get("tool_calls"):
+        # use last tool_call args tail
+        for tc in reversed(msg["tool_calls"]):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str) and args:
+                ptext = args[:200]
+                psrc = "tool_args"
+                break
+    logger.info(f"[SSE] complete chunks={chunk_count} finish_reason={finish_reason or 'stop'} preview({psrc})={ptext}")
 
     return Response(content=json.dumps(final, ensure_ascii=False).encode("utf-8"), status_code=200, media_type="application/json")
 
