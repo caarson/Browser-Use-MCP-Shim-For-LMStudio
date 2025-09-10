@@ -12,7 +12,10 @@ a = Analysis([
 ],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('images/logos/CloudflareLogo(2560x846px).png', 'images/logos'),
+        ('images/logos/LMStudioHelperCharacter(1296x912px).png', 'images/logos'),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
@@ -27,12 +30,12 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='lmstudio_shim',
+    name='ShimServer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=False,
 )
 coll = COLLECT(
     exe,
@@ -42,5 +45,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='lmstudio_shim',
+    name='ShimServer',
 )

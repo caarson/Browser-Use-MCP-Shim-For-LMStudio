@@ -1,0 +1,71 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build ShimServer.exe with PyInstaller",
+			"type": "shell",
+			"command": "pyinstaller",
+			"args": [
+				"--clean",
+				"--noconfirm",
+				"pyinstaller.spec"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ShimServer.exe with PyInstaller",
+			"type": "shell",
+			"command": "C:/Users/imitr/OneDrive/Documentos/GitHub/Browser-Use-MCP-Shim-For-LMStudio/.venv/Scripts/python.exe",
+			"args": [
+				"-m",
+				"PyInstaller",
+				"--clean",
+				"--noconfirm",
+				"pyinstaller.spec"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ShimServer.exe (module path)",
+			"type": "shell",
+			"command": "C:/Users/imitr/OneDrive/Documentos/GitHub/Browser-Use-MCP-Shim-For-LMStudio/.venv/Scripts/python.exe",
+			"args": [
+				"-m",
+				"pyinstaller",
+				"--clean",
+				"--noconfirm",
+				"pyinstaller.spec"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build ShimServer.exe (module path)",
+			"type": "shell",
+			"command": "C:/Users/imitr/OneDrive/Documentos/GitHub/Browser-Use-MCP-Shim-For-LMStudio/.venv/Scripts/python.exe",
+			"args": [
+				"-m",
+				"PyInstaller",
+				"--clean",
+				"--noconfirm",
+				"pyinstaller.spec"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}
