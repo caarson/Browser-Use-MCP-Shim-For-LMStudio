@@ -63,12 +63,22 @@ logger = logging.getLogger("lmstudio_shim")
 app = FastAPI()
 
 def _massage_chat_payload(payload: Dict[str, Any], force_stream: Optional[bool] = None) -> Dict[str, Any]:
-    # Fix tool_choice: LM Studio only accepts "none" | "auto" | "required"
+    # Tool choice normalization:
+    # - If tool_choice is a valid string ("auto"|"none"|"required"), keep it.
+    # - If it's an object, down-convert to "auto" if tools exist; otherwise remove tool_choice.
+    # - If no tools, remove tool_choice entirely to let client default apply.
     tc = payload.get("tool_choice")
-    if isinstance(tc, dict):
-        # If tools are provided and caller tried to force a specific tool, "required" is closer in spirit.
-        has_tools = bool(payload.get("tools"))
-        payload["tool_choice"] = "required" if has_tools else "auto"
+    has_tools = bool(payload.get("tools"))
+    if isinstance(tc, str) and tc in ("auto", "none", "required"):
+        pass  # keep as-is
+    elif isinstance(tc, dict):
+        if has_tools:
+            payload["tool_choice"] = "auto"
+        else:
+            payload.pop("tool_choice", None)
+    else:
+        if not has_tools:
+            payload.pop("tool_choice", None)
 
     # Optional: some servers choke on complex response_format; keep the simple ones
     rf = payload.get("response_format")
@@ -171,8 +181,9 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
     # Ensure stream True for upstream, allow per-request overrides of shim timeouts
     up_payload = dict(payload)
     up_payload["stream"] = True
-    connect_timeout = SHIM_CONNECT_TIMEOUT
-    read_timeout = SHIM_READ_TIMEOUT
+    # For CF streaming mode, prefer a long read timeout so we don't cut long "thinking" pauses.
+    connect_timeout = 10.0 if SHIM_CONNECT_TIMEOUT is None else SHIM_CONNECT_TIMEOUT
+    read_timeout = 900.0  # per request: 10s connect, 900s read as default for streaming mode
     # Optional: payload can include shim-specific hints
     shim_cfg = up_payload.get("shim") or {}
     try:
@@ -251,9 +262,13 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
             try:
                 line = next(line_iter)
             except RequestsTimeout:
-                inactivity_fired = True
-                logger.info("[SSE] inactivity read-timeout; finalizing partial result")
-                break
+                # Upstream paused beyond read timeout; return a clean error instead of silently finalizing.
+                logger.warning("[SSE] upstream read timed out; returning error")
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return JSONResponse(status_code=504, content={"error": {"type": "upstream_timeout", "message": "Shim upstream read timed out"}})
             except StopIteration:
                 # End of stream
                 if event_data_parts:
