@@ -29,7 +29,8 @@ class ServerController:
     def start(self, host: str, port: int):
         if self._running:
             return
-        config = uvicorn.Config(shim.app, host=host, port=port, log_level="info")
+        # Disable uvicorn's default logging config in frozen apps to avoid isatty-related formatter failures
+        config = uvicorn.Config(shim.app, host=host, port=port, log_level="info", log_config=None)
         self.server = uvicorn.Server(config)
 
         def run():

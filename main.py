@@ -30,7 +30,8 @@ def main():
         shim.set_cf_streaming_enabled(args.cf_streaming == 'on')
     import uvicorn
     print(f"Starting shim server at http://{args.host}:{args.port} (upstream: {shim.LMSTUDIO_BASE})")
-    uvicorn.run(shim.app, host=args.host, port=args.port)
+    # Disable uvicorn's default colorized logging to avoid isatty errors under one-file EXE
+    uvicorn.run(shim.app, host=args.host, port=args.port, log_config=None, log_level="info")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
+hiddenimports = collect_submodules('uvicorn') + collect_submodules('fastapi')
+
 
 a = Analysis(
     ['main.py'],
@@ -9,7 +13,7 @@ a = Analysis(
         ('images/logos/CloudflareLogo(2560x846px).png', 'images/logos'),
         ('images/logos/LMStudioHelperCharacter(1296x912px).png', 'images/logos'),
     ],
-    hiddenimports=[],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
