@@ -3,6 +3,7 @@ import time
 from typing import Dict, Any, Optional, List
 from urllib.parse import urljoin
 import json
+import re
 import logging
 import requests
 from requests import Timeout as RequestsTimeout
@@ -24,6 +25,9 @@ try:
     SHIM_READ_TIMEOUT = float(os.getenv("SHIM_READ_TIMEOUT", "60"))
 except Exception:
     SHIM_READ_TIMEOUT = 60.0
+
+# Optionally strip reasoning tags like <think>...</think> from final content (default: keep)
+SHIM_STRIP_THINK: bool = os.getenv("SHIM_STRIP_THINK", "0").lower() in ("1", "true", "on", "yes")
 
 def set_lmstudio_base(base_url: str) -> str:
     """Update the base URL used to reach the upstream LM Studio server.
@@ -242,6 +246,80 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
                 return data
         return obj if isinstance(obj, dict) else {}
 
+    def merge_choice_into_acc(choice_obj: Dict[str, Any]):
+        """Merge a single choices[*] object into accumulators, supporting both delta.* and message.* shapes."""
+        nonlocal acc_role, finish_reason
+        delta = choice_obj.get("delta") or {}
+        fr = choice_obj.get("finish_reason")
+        if fr:
+            finish_reason = fr
+        # Prefer delta fields first
+        if acc_role is None and isinstance(delta.get("role"), str):
+            acc_role = delta["role"]
+        if isinstance(delta.get("content"), str):
+            acc_content_parts.append(delta["content"])
+        tc = delta.get("tool_calls")
+        if isinstance(tc, list):
+            for entry in tc:
+                try:
+                    idx = entry.get("index", 0)
+                    if not isinstance(idx, int) or idx < 0:
+                        idx = 0
+                    ensure_tc_len(idx)
+                    target = acc_tool_calls[idx]
+                    if entry.get("id"):
+                        target["id"] = entry["id"]
+                    if entry.get("type"):
+                        target["type"] = entry["type"]
+                    fn = entry.get("function") or {}
+                    tf = target.setdefault("function", {"name": None, "arguments": ""})
+                    if fn.get("name"):
+                        tf["name"] = fn["name"]
+                    args_val = fn.get("arguments")
+                    if isinstance(args_val, str):
+                        tf["arguments"] += args_val
+                    elif isinstance(args_val, (dict, list)):
+                        try:
+                            tf["arguments"] += json.dumps(args_val, ensure_ascii=False)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Failed to merge tool_call entry: {e}")
+        # Fallback: some servers send final content/tool_calls under message.*
+        msg_obj = choice_obj.get("message") or {}
+        if isinstance(msg_obj, dict):
+            if acc_role is None and isinstance(msg_obj.get("role"), str):
+                acc_role = msg_obj["role"]
+            if isinstance(msg_obj.get("content"), str) and not delta.get("content"):
+                acc_content_parts.append(msg_obj["content"])
+            mtc = msg_obj.get("tool_calls")
+            if isinstance(mtc, list) and not tc:
+                for entry in mtc:
+                    try:
+                        idx = entry.get("index", 0)
+                        if not isinstance(idx, int) or idx < 0:
+                            idx = 0
+                        ensure_tc_len(idx)
+                        target = acc_tool_calls[idx]
+                        if entry.get("id"):
+                            target["id"] = entry["id"]
+                        if entry.get("type"):
+                            target["type"] = entry["type"]
+                        fn = entry.get("function") or {}
+                        tf = target.setdefault("function", {"name": None, "arguments": ""})
+                        if fn.get("name"):
+                            tf["name"] = fn["name"]
+                        args_val = fn.get("arguments")
+                        if isinstance(args_val, str):
+                            tf["arguments"] += args_val
+                        elif isinstance(args_val, (dict, list)):
+                            try:
+                                tf["arguments"] += json.dumps(args_val, ensure_ascii=False)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(f"Failed to merge message.tool_calls entry: {e}")
+
     def _compute_preview() -> tuple[str, str]:
         """Return (preview_text, source) where source is 'content' or 'tool_args'."""
         if acc_content_parts:
@@ -293,41 +371,7 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
                                 model_name = m
                         choices = chunk.get("choices") or []
                         for ch in choices:
-                            delta = ch.get("delta") or {}
-                            fr = ch.get("finish_reason")
-                            if fr:
-                                finish_reason = fr
-                            if acc_role is None and isinstance(delta.get("role"), str):
-                                acc_role = delta["role"]
-                            if isinstance(delta.get("content"), str):
-                                acc_content_parts.append(delta["content"])
-                            tc = delta.get("tool_calls")
-                            if isinstance(tc, list):
-                                for entry in tc:
-                                    try:
-                                        idx = entry.get("index", 0)
-                                        if not isinstance(idx, int) or idx < 0:
-                                            idx = 0
-                                        ensure_tc_len(idx)
-                                        target = acc_tool_calls[idx]
-                                        if entry.get("id"):
-                                            target["id"] = entry["id"]
-                                        if entry.get("type"):
-                                            target["type"] = entry["type"]
-                                        fn = entry.get("function") or {}
-                                        tf = target.setdefault("function", {"name": None, "arguments": ""})
-                                        if fn.get("name"):
-                                            tf["name"] = fn["name"]
-                                        args_val = fn.get("arguments")
-                                        if isinstance(args_val, str):
-                                            tf["arguments"] += args_val
-                                        elif isinstance(args_val, (dict, list)):
-                                            try:
-                                                tf["arguments"] += json.dumps(args_val, ensure_ascii=False)
-                                            except Exception:
-                                                pass
-                                    except Exception as e:
-                                        logger.warning(f"Failed to merge tool_call entry: {e}")
+                            merge_choice_into_acc(ch)
                         preview, src = _compute_preview()
                         logger.info(f"[SSE] chunks={chunk_count} preview({src})={preview.encode('utf-8','ignore')[:200].decode('utf-8','ignore')}")
                     except Exception as e:
@@ -371,41 +415,7 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
 
                     choices = chunk.get("choices") or []
                     for ch in choices:
-                        delta = ch.get("delta") or {}
-                        fr = ch.get("finish_reason")
-                        if fr:
-                            finish_reason = fr
-                        if acc_role is None and isinstance(delta.get("role"), str):
-                            acc_role = delta["role"]
-                        if isinstance(delta.get("content"), str):
-                            acc_content_parts.append(delta["content"])
-                        tc = delta.get("tool_calls")
-                        if isinstance(tc, list):
-                            for entry in tc:
-                                try:
-                                    idx = entry.get("index", 0)
-                                    if not isinstance(idx, int) or idx < 0:
-                                        idx = 0
-                                    ensure_tc_len(idx)
-                                    target = acc_tool_calls[idx]
-                                    if entry.get("id"):
-                                        target["id"] = entry["id"]
-                                    if entry.get("type"):
-                                        target["type"] = entry["type"]
-                                    fn = entry.get("function") or {}
-                                    tf = target.setdefault("function", {"name": None, "arguments": ""})
-                                    if fn.get("name"):
-                                        tf["name"] = fn["name"]
-                                    args_val = fn.get("arguments")
-                                    if isinstance(args_val, str):
-                                        tf["arguments"] += args_val
-                                    elif isinstance(args_val, (dict, list)):
-                                        try:
-                                            tf["arguments"] += json.dumps(args_val, ensure_ascii=False)
-                                        except Exception:
-                                            pass
-                                except Exception as e:
-                                    logger.warning(f"Failed to merge tool_call entry: {e}")
+                        merge_choice_into_acc(ch)
 
                     now = time.time()
                     if now - last_log >= 2.0:
@@ -436,7 +446,21 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
 
     msg: Dict[str, Any] = {"role": acc_role or "assistant"}
     if acc_content_parts:
-        msg["content"] = "".join(acc_content_parts)
+        content_text = "".join(acc_content_parts)
+        # Optional reasoning tag stripping
+        strip_think = SHIM_STRIP_THINK
+        try:
+            shim_cfg = payload.get("shim") or {}
+            if isinstance(shim_cfg.get("strip_think"), bool):
+                strip_think = bool(shim_cfg["strip_think"])
+        except Exception:
+            pass
+        if strip_think:
+            try:
+                content_text = re.sub(r"<think>.*?</think>", "", content_text, flags=re.DOTALL|re.IGNORECASE)
+            except Exception:
+                pass
+        msg["content"] = content_text
     else:
         msg["content"] = None
     if any((tc.get("id") or tc.get("function", {}).get("name") or tc.get("function", {}).get("arguments")) for tc in acc_tool_calls):
@@ -457,18 +481,20 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
         ],
     }
 
-    # Final log
-    ptext, psrc = (msg.get("content") or "")[:200], "content"
+    # Final log (show tail preview and length to avoid confusion about truncation)
+    full_content = msg.get("content") or ""
+    ptext, psrc = (full_content[-200:] if full_content else ""), "content"
     if not ptext and msg.get("tool_calls"):
         # use last tool_call args tail
         for tc in reversed(msg["tool_calls"]):
             fn = tc.get("function") or {}
             args = fn.get("arguments")
             if isinstance(args, str) and args:
-                ptext = args[:200]
+                ptext = args[-200:]
                 psrc = "tool_args"
                 break
-    logger.info(f"[SSE] complete chunks={chunk_count} finish_reason={finish_reason or 'stop'} preview({psrc})={ptext}")
+    clen = len(full_content) if isinstance(full_content, str) else 0
+    logger.info(f"[SSE] complete chunks={chunk_count} finish_reason={finish_reason or 'stop'} preview_tail({psrc},len={clen})={ptext}")
 
     return Response(content=json.dumps(final, ensure_ascii=False).encode("utf-8"), status_code=200, media_type="application/json")
 

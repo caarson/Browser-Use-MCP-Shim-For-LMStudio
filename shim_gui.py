@@ -323,10 +323,13 @@ class ShimGUI(tk.Tk):
         self.controller.stop()
         self.status_var.set("Stopped")
         self.status_lbl.configure(foreground=self._vs_colors['error'])
+        # Force-refresh UI button states immediately
         self.start_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self.open_btn.configure(state=tk.DISABLED)
         self.copy_btn.configure(state=tk.DISABLED)
+        # Also schedule a follow-up check to catch late thread exits
+        self.after(200, self._update_status)
 
     def open_models(self):
         if not self.controller.running:
@@ -336,17 +339,29 @@ class ShimGUI(tk.Tk):
         webbrowser.open(f"http://{host}:{port}/v1/models")
 
     def _update_status(self):
-        # Periodically verify thread state
-        if self.controller.running:
-            pass
+        # Periodically verify thread/server state and enforce button states
+        is_running = bool(self.controller.running)
+        if is_running:
+            # Ensure buttons reflect running state
+            if str(self.start_btn['state']) != str(tk.DISABLED):
+                self.start_btn.configure(state=tk.DISABLED)
+            if str(self.stop_btn['state']) != str(tk.NORMAL):
+                self.stop_btn.configure(state=tk.NORMAL)
+            if str(self.open_btn['state']) != str(tk.NORMAL):
+                self.open_btn.configure(state=tk.NORMAL)
+            if str(self.copy_btn['state']) != str(tk.NORMAL):
+                self.copy_btn.configure(state=tk.NORMAL)
         else:
-            # If thread ended unexpectedly
-            if self.stop_btn['state'] == tk.NORMAL and not self.controller.running:
-                self.status_var.set("Stopped")
-                self.status_lbl.configure(foreground=self._vs_colors['error'])
+            # Stopped state; make sure UI is reset
+            self.status_var.set("Stopped")
+            self.status_lbl.configure(foreground=self._vs_colors['error'])
+            if str(self.start_btn['state']) != str(tk.NORMAL):
                 self.start_btn.configure(state=tk.NORMAL)
+            if str(self.stop_btn['state']) != str(tk.DISABLED):
                 self.stop_btn.configure(state=tk.DISABLED)
+            if str(self.open_btn['state']) != str(tk.DISABLED):
                 self.open_btn.configure(state=tk.DISABLED)
+            if str(self.copy_btn['state']) != str(tk.DISABLED):
                 self.copy_btn.configure(state=tk.DISABLED)
         self.after(1000, self._update_status)
 
