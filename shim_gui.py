@@ -9,6 +9,13 @@ from typing import Optional
 import logging
 import sys
 from tkinter import scrolledtext
+import subprocess
+import re
+import time
+try:
+    import psutil  # type: ignore  # Optional: used for port/process management
+except Exception:
+    psutil = None
 
 # Import the FastAPI app and setter from shim module
 import lmstudio_toolchoice_shim as shim
@@ -179,10 +186,20 @@ class ShimGUI(tk.Tk):
         self.open_btn.grid(row=0, column=2, padx=(0, 8))
 
         self.copy_btn = ttk.Button(controls, text='Copy Shim URL', style='VS.TButton', command=self.copy_shim_url, state=tk.DISABLED)
-        self.copy_btn.grid(row=0, column=3)
+        self.copy_btn.grid(row=0, column=3, padx=(0,8))
+
+        # Row 0 extra controls: always present and clickable
+        self.kill_port_btn = ttk.Button(controls, text='Stop All on Port', style='VS.TButton', command=self.stop_all_on_port)
+        self.kill_port_btn.grid(row=0, column=4, padx=(0, 8))
+
+        self.kill_mcp_btn = ttk.Button(controls, text='Kill mcp-browser-use', style='VS.TButton', command=self.kill_mcp_browser_use)
+        self.kill_mcp_btn.grid(row=0, column=5)
+
+        # Keep same colspan regardless; buttons remain enabled even if psutil is missing
+        cf_colspan = 6
 
         self.cf_btn = ttk.Button(controls, text=self._cf_btn_text(), style='VS.TButton', command=self.toggle_cf_streaming)
-        self.cf_btn.grid(row=1, column=0, columnspan=4, sticky='w', pady=(8, 0))
+        self.cf_btn.grid(row=1, column=0, columnspan=cf_colspan, sticky='w', pady=(8, 0))
 
         # Status
         status_frame = ttk.Frame(content, style='VS.TFrame')
@@ -337,6 +354,175 @@ class ShimGUI(tk.Tk):
         host = self.host_var.get().strip() or "127.0.0.1"
         port = self.port_var.get().strip() or "8088"
         webbrowser.open(f"http://{host}:{port}/v1/models")
+
+    def stop_all_on_port(self):
+        """Stop our server (if running) and then kill any process bound to the selected port."""
+        try:
+            # Stop our own server first
+            if self.controller.running:
+                self.stop_server()
+            port_str = self.port_var.get().strip() or "8088"
+            port = int(port_str)
+        except Exception as e:
+            messagebox.showerror("Invalid Port", f"Provide a valid port: {e}")
+            return
+        # Gather PIDs and terminate using psutil if available, else Windows 'netstat' + 'taskkill' fallback
+        pids = set()
+        if psutil is not None:
+            try:
+                for p in psutil.process_iter(attrs=['pid','name','cmdline']):
+                    try:
+                        conns = p.connections(kind='inet')
+                    except Exception:
+                        continue
+                    for c in conns:
+                        try:
+                            laddr = getattr(c, 'laddr', None)
+                            if not laddr:
+                                continue
+                            lport = getattr(laddr, 'port', None)
+                            if lport is None and isinstance(laddr, tuple) and len(laddr) > 1:
+                                lport = laddr[1]
+                            if lport == port:
+                                pids.add(p.pid)
+                        except Exception:
+                            continue
+            except Exception as e:
+                self._append_log_line(f"Failed to enumerate processes via psutil: {e}")
+        else:
+            # Windows-only fallback using netstat
+            if os.name == 'nt':
+                try:
+                    # Capture all TCP/UDP listeners, filter by :port
+                    out = subprocess.check_output(['netstat', '-ano'], text=True, stderr=subprocess.STDOUT)
+                    pat = re.compile(rf"\S+\s+\S*:{port}\s+.*?LISTENING\s+(\d+)")
+                    for line in out.splitlines():
+                        m = pat.search(line)
+                        if m:
+                            try:
+                                pids.add(int(m.group(1)))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self._append_log_line(f"netstat failed: {e}")
+            else:
+                self._append_log_line("Port kill fallback not implemented for this OS without psutil.")
+
+        if not pids:
+            self._append_log_line(f"No processes found listening on port {port}.")
+            return
+
+        killed = []
+        failed = []
+        for pid in sorted(pids):
+            if self._terminate_pid(pid):
+                killed.append(pid)
+            else:
+                failed.append(pid)
+
+        self._append_log_line(f"Terminated {len(killed)} process(es) on port {port}: {killed if killed else 'none'}")
+        if failed:
+            self._append_log_line(f"Failed to terminate PIDs: {failed}. Try running as Administrator.")
+
+    def kill_mcp_browser_use(self):
+        """Kill any process whose name or command line mentions 'mcp-browser-use'."""
+        needle = 'mcp-browser-use'
+        pids = set()
+        if psutil is not None:
+            for p in psutil.process_iter(attrs=['pid','name','cmdline']):
+                try:
+                    name = (p.info.get('name') or '').lower()
+                    cmd = ' '.join(p.info.get('cmdline') or []).lower()
+                    if needle in name or needle in cmd:
+                        pids.add(p.pid)
+                except Exception:
+                    pass
+        else:
+            if os.name == 'nt':
+                try:
+                    # Use PowerShell to find by Name or CommandLine containing the needle
+                    ps_cmd = [
+                        'powershell', '-NoProfile', '-Command',
+                        f"$p=Get-CimInstance Win32_Process | Where-Object {{$_.Name -match '{needle}' -or $_.CommandLine -match '{needle}'}}; $p | ForEach-Object {{$_.ProcessId}}"
+                    ]
+                    out = subprocess.check_output(ps_cmd, text=True, stderr=subprocess.STDOUT)
+                    for line in out.split():
+                        try:
+                            pids.add(int(line.strip()))
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self._append_log_line(f"PowerShell process search failed: {e}")
+            else:
+                try:
+                    out = subprocess.check_output(['ps', '-eo', 'pid,comm,args'], text=True, stderr=subprocess.STDOUT)
+                    for line in out.splitlines():
+                        if needle in line.lower():
+                            try:
+                                pid = int(line.strip().split(None, 1)[0])
+                                pids.add(pid)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self._append_log_line(f"ps search failed: {e}")
+
+        if not pids:
+            self._append_log_line("No 'mcp-browser-use' processes found.")
+            return
+
+        killed = []
+        failed = []
+        for pid in sorted(pids):
+            if self._terminate_pid(pid):
+                killed.append(pid)
+            else:
+                failed.append(pid)
+        self._append_log_line(f"Terminated {len(killed)} 'mcp-browser-use' process(es): {killed if killed else 'none'}")
+        if failed:
+            self._append_log_line(f"Failed to terminate PIDs: {failed}. Try running as Administrator.")
+
+    def _terminate_pid(self, pid: int) -> bool:
+        """Terminate PID using psutil when available, else OS-specific commands. Returns True on success."""
+        try:
+            if psutil is not None:
+                try:
+                    p = psutil.Process(pid)
+                    p.terminate()
+                    try:
+                        p.wait(timeout=2)
+                    except Exception:
+                        pass
+                    if p.is_running():
+                        p.kill()
+                    return True
+                except Exception:
+                    return False
+            # Fallbacks
+            if os.name == 'nt':
+                try:
+                    subprocess.check_call(['taskkill', '/PID', str(pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True
+                except Exception:
+                    return False
+            else:
+                try:
+                    os.kill(pid, 15)
+                    time.sleep(0.5)
+                    # If still alive, force kill
+                    os.kill(pid, 9)
+                    return True
+                except Exception:
+                    return False
+        except Exception:
+            return False
+
+    def _append_log_line(self, text: str):
+        try:
+            self.log_text.configure(state='normal')
+            self.log_text.insert('end', text + "\n")
+            self.log_text.see('end')
+        finally:
+            self.log_text.configure(state='disabled')
 
     def _update_status(self):
         # Periodically verify thread/server state and enforce button states
