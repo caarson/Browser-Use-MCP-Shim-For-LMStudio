@@ -1,4 +1,4 @@
-# Browser-Use-MCP-Shim-For-LMStudio
+# Cline-Shim-for-LMStudio
 
 A lightweight reverse-proxy shim that stitches LM Studio’s SSE streaming responses into a single OpenAI-compatible Chat Completion response. Includes a VS Code-like GUI to start/stop the local server and view logs.
 
@@ -101,3 +101,101 @@ Tip: Keep LM Studio’s local server ON with a model loaded. Confirm with:
 ```
 curl http://127.0.0.1:1234/v1/models
 ```
+
+## GPT-OSS Mode
+
+When enabled, the shim injects a contract and normalizes GPT-OSS outputs into Cline’s canonical tool format.
+
+- Accepts OpenAI-style `tool_calls[]` or plain JSON blocks in the assistant message
+- Produces exactly one of:
+  - `{"tool":"<name>","args":{...}}`
+  - `{"final":"<answer>"}`
+- Validates against built-in tools and any MCP tools provided via headers
+- Retries once on invalid JSON/args with a corrective system message; falls back to a final text otherwise
+
+Built-in tools: `write_to_file`, `read_file`, `replace_in_file`, `search_files`, `list_files`, `execute_command`, `list_code_definition_names`, `use_mcp_tool`, `access_mcp_resource`, `ask_followup_question`, `attempt_completion`.
+
+### Toggle
+
+- GUI button: Enable/Disable GPT-OSS Mode
+- CLI flag: `--gpt-oss on|off`
+- Per-request header: `X-GPT-OSS-MODE: true|false`
+
+### MCP Tools
+
+Provide runtime tool allow-list and optional schemas via headers:
+
+- `X-MCP-TOOLS: run_browser_agent,run_deep_research`
+- Optional JSON:
+  - `X-MCP-TOOLS-JSON`: JSON list of names or object `{ name: schema }`
+  - `X-MCP-TOOL-SCHEMAS`: JSON object `{ name: { argName: typeName } }` where typeName in `string|number|integer|boolean|object`
+
+### Telemetry logs
+
+- `gptoss.normalized`
+- `gptoss.retry`
+- `gptoss.multiple_calls`
+- `gptoss.fallback_final`
+
+### Tests
+
+Run adapter tests:
+
+```
+python -m pytest -q
+```
+
+## MCP tool discovery (Cline config)
+
+The shim can auto-discover available MCP tools by reading Cline's MCP settings file. This augments the built-ins and any tools provided via headers.
+
+How it works:
+- In the GUI, set the path next to `Cline Config (JSON) path` or click `Auto Discover` to find it automatically.
+- The shim reads and caches the config with a short TTL and reloads when the file's mtime changes.
+- Tools discovered here are merged with any per-request tool headers.
+
+Override via env var:
+- `CLINE_CONFIG_PATH` can be set to a full file path; the GUI and shim will use that value.
+
+### Where to find the Cline config
+
+Cline stores its MCP configuration inside the editor's global storage under the Cline extension namespace `saoudrizwan.claude-dev`:
+- File name: `cline_mcp_settings.json`
+- Subfolder: `settings`
+
+Windows (VS Code/VSCodium/Cursor):
+- `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+- `%APPDATA%\Code - Insiders\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+- `%APPDATA%\VSCodium\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+- `%APPDATA%\Cursor\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+
+macOS:
+- `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/Library/Application Support/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/Library/Application Support/VSCodium/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/Library/Application Support/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+
+Linux:
+- `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- `~/.config/Cursor/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+
+Also checked as fallbacks (lower priority):
+- Project: `./cline_config.json`, `./cline.config.json`, `./cline.json`, and `./.vscode/cline.json`
+- Home: `~/.cline/config.json`
+
+Tip (Windows PowerShell): quickly check common locations
+
+```
+$targets = @(
+  "$env:APPDATA\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json",
+  "$env:APPDATA\Code - Insiders\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json",
+  "$env:APPDATA\VSCodium\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json",
+  "$env:APPDATA\Cursor\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json"
+)
+$targets | ForEach-Object { if (Test-Path $_) { Write-Host "Found: $_" } else { Write-Host "Missing: $_" } }
+```
+
+If Auto Discover still can’t find the file, paste the discovered path into the GUI field or set `CLINE_CONFIG_PATH` and restart the shim.
+

@@ -10,6 +10,7 @@ def main():
     parser.add_argument('--port', type=int, default=8088, help='Shim server port (default: 8088)')
     parser.add_argument('--lmstudio-base', type=str, default=None, help='LM Studio base URL (e.g. http://127.0.0.1:1234)')
     parser.add_argument('--cf-streaming', type=str, choices=['on','off'], default=None, help='Enable Cloudflare upstream streaming (stitch into single response)')
+    parser.add_argument('--gpt-oss', type=str, choices=['on','off'], default=None, help='Enable GPT-OSS Mode (normalize tool calls)')
     args = parser.parse_args()
 
     # If no arguments given at all, default to GUI for user convenience
@@ -28,6 +29,9 @@ def main():
     # Apply CF streaming state for CLI mode if provided
     if args.cf_streaming is not None:
         shim.set_cf_streaming_enabled(args.cf_streaming == 'on')
+    # Apply GPT-OSS mode default
+    if args.gpt_oss is not None:
+        shim.set_gpt_oss_mode_default(args.gpt_oss == 'on')
     import uvicorn
     print(f"Starting shim server at http://{args.host}:{args.port} (upstream: {shim.LMSTUDIO_BASE})")
     # Disable uvicorn's default colorized logging to avoid isatty errors under one-file EXE

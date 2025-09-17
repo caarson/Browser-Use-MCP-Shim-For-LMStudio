@@ -85,6 +85,21 @@ class ShimGUI(tk.Tk):
         except Exception:
             pass
 
+        # GPT-OSS mode toggle (persisted)
+        self.gptoss_enabled = bool(self._initial_values.get("gpt_oss_mode", False) or shim.is_gpt_oss_mode_default())
+        try:
+            shim.set_gpt_oss_mode_default(self.gptoss_enabled)
+        except Exception:
+            pass
+
+        # Cline config path for MCP discovery (optional)
+        self.cline_cfg_var = tk.StringVar(value=self._initial_values.get("cline_config_path", ""))
+        try:
+            if self.cline_cfg_var.get().strip():
+                shim.set_cline_config_path(self.cline_cfg_var.get().strip())
+        except Exception:
+            pass
+
         # Apply theme first
         self._apply_vs_theme()
 
@@ -161,20 +176,27 @@ class ShimGUI(tk.Tk):
         e_upstream = ttk.Entry(content, textvariable=self.lmstudio_var, width=48, style='VS.TEntry')
         e_upstream.grid(row=0, column=1, sticky='we', padx=(8, 0))
 
+        # Cline config path (for MCP auto-discovery)
+        ttk.Label(content, text='Cline Config (JSON) path:', style='VS.TLabel').grid(row=1, column=0, sticky='w', pady=(8, 0))
+        e_cfg = ttk.Entry(content, textvariable=self.cline_cfg_var, width=48, style='VS.TEntry')
+        e_cfg.grid(row=1, column=1, sticky='we', padx=(8, 0), pady=(8, 0))
+        autod_btn = ttk.Button(content, text='Auto Discover', style='VS.TButton', command=self.auto_discover_cline_config)
+        autod_btn.grid(row=1, column=2, sticky='w', padx=(8,0), pady=(8,0))
+
         # Host/Port
-        ttk.Label(content, text='Shim Host:', style='VS.TLabel').grid(row=1, column=0, sticky='w', pady=(8, 0))
+        ttk.Label(content, text='Shim Host:', style='VS.TLabel').grid(row=2, column=0, sticky='w', pady=(8, 0))
         self.host_var = tk.StringVar(value=self._initial_values.get('host', '127.0.0.1'))
         e_host = ttk.Entry(content, textvariable=self.host_var, width=18, style='VS.TEntry')
-        e_host.grid(row=1, column=1, sticky='w', padx=(8, 0), pady=(8, 0))
+        e_host.grid(row=2, column=1, sticky='w', padx=(8, 0), pady=(8, 0))
 
-        ttk.Label(content, text='Shim Port:', style='VS.TLabel').grid(row=2, column=0, sticky='w', pady=(8, 0))
+        ttk.Label(content, text='Shim Port:', style='VS.TLabel').grid(row=3, column=0, sticky='w', pady=(8, 0))
         self.port_var = tk.StringVar(value=str(self._initial_values.get('port', 8088)))
         e_port = ttk.Entry(content, textvariable=self.port_var, width=10, style='VS.TEntry')
-        e_port.grid(row=2, column=1, sticky='w', padx=(8, 0), pady=(8, 0))
+        e_port.grid(row=3, column=1, sticky='w', padx=(8, 0), pady=(8, 0))
 
         # Controls
         controls = ttk.Frame(content, style='VS.TFrame')
-        controls.grid(row=3, column=0, columnspan=2, sticky='w', pady=(12, 4))
+        controls.grid(row=4, column=0, columnspan=2, sticky='w', pady=(12, 4))
 
         self.start_btn = ttk.Button(controls, text='Start Server', style='VS.TButton', command=self.start_server)
         self.start_btn.grid(row=0, column=0, padx=(0, 8))
@@ -201,17 +223,21 @@ class ShimGUI(tk.Tk):
         self.cf_btn = ttk.Button(controls, text=self._cf_btn_text(), style='VS.TButton', command=self.toggle_cf_streaming)
         self.cf_btn.grid(row=1, column=0, columnspan=cf_colspan, sticky='w', pady=(8, 0))
 
+        # GPT-OSS Mode toggle
+        self.gptoss_btn = ttk.Button(controls, text=self._gptoss_btn_text(), style='VS.TButton', command=self.toggle_gptoss_mode)
+        self.gptoss_btn.grid(row=2, column=0, columnspan=cf_colspan, sticky='w', pady=(8, 0))
+
         # Status
         status_frame = ttk.Frame(content, style='VS.TFrame')
-        status_frame.grid(row=4, column=0, columnspan=2, sticky='we')
+        status_frame.grid(row=5, column=0, columnspan=2, sticky='we')
         self.status_var = tk.StringVar(value='Stopped')
         self.status_lbl = ttk.Label(status_frame, textvariable=self.status_var, style='VS.Status.TLabel')
         self.status_lbl.grid(row=0, column=0, sticky='w')
 
         # Log panel
         log_frame = ttk.Frame(content, style='VS.TFrame')
-        log_frame.grid(row=5, column=0, columnspan=2, sticky='nsew', pady=(8, 0))
-        content.grid_rowconfigure(5, weight=1)
+        log_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', pady=(8, 0))
+        content.grid_rowconfigure(6, weight=1)
         ttk.Label(log_frame, text='Logs:', style='VS.TLabel').grid(row=0, column=0, sticky='w')
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=14, wrap='word')
@@ -229,6 +255,114 @@ class ShimGUI(tk.Tk):
 
         # After widgets exist, hook logging to GUI
         self._setup_logging_to_gui()
+
+    # ------------- Auto discovery for Cline config -------------
+    def _candidate_cline_config_paths(self) -> list[str]:
+        candidates: list[str] = []
+        # 1) Env override
+        env_path = os.environ.get('CLINE_CONFIG_PATH')
+        if env_path and os.path.isfile(env_path):
+            candidates.append(env_path)
+
+        # 2) CWD common names
+        cwd = os.getcwd()
+        for name in ("cline_config.json", "cline.config.json", "cline.json"):
+            p = os.path.join(cwd, name)
+            if os.path.isfile(p):
+                candidates.append(p)
+
+        # 3) .vscode/cline.json in CWD and parents
+        def walk_parents(start: str):
+            path = os.path.abspath(start)
+            seen = set()
+            while path not in seen:
+                yield path
+                seen.add(path)
+                parent = os.path.dirname(path)
+                if parent == path:
+                    break
+                path = parent
+
+        for base in walk_parents(cwd):
+            p = os.path.join(base, ".vscode", "cline.json")
+            if os.path.isfile(p):
+                candidates.append(p)
+
+        # 4) User home standard
+        home = os.path.expanduser("~")
+        p = os.path.join(home, ".cline", "config.json")
+        if os.path.isfile(p):
+            candidates.append(p)
+
+        # 5) VS Code/VSCodium/Cursor globalStorage for Cline (common real location)
+        #    Cline extension ID: saoudrizwan.claude-dev
+        #    File of interest: settings/cline_mcp_settings.json
+        #    Windows: %APPDATA%\<Product>\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json
+        #    macOS:   ~/Library/Application Support/<Product>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json
+        #    Linux:   ~/.config/<Product>/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json
+        try:
+            products = [
+                "Code",
+                "Code - Insiders",
+                "VSCodium",
+                "Code - OSS",
+                "Cursor",
+            ]
+            ext_ns = os.path.join("saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json")
+            if os.name == 'nt':
+                appdata = os.path.expandvars(os.environ.get('APPDATA', ''))  # C:\Users\<user>\AppData\Roaming
+                if appdata:
+                    for prod in products:
+                        p = os.path.join(appdata, prod, "User", "globalStorage", ext_ns)
+                        if os.path.isfile(p):
+                            candidates.append(p)
+            elif sys.platform == 'darwin':
+                base = os.path.expanduser(os.path.join("~", "Library", "Application Support"))
+                for prod in products:
+                    p = os.path.join(base, prod, "User", "globalStorage", ext_ns)
+                    if os.path.isfile(p):
+                        candidates.append(p)
+            else:
+                # Assume XDG-style ~/.config
+                base = os.path.expanduser(os.path.join("~", ".config"))
+                for prod in products:
+                    p = os.path.join(base, prod, "User", "globalStorage", ext_ns)
+                    if os.path.isfile(p):
+                        candidates.append(p)
+        except Exception:
+            pass
+
+        # De-dup preserve order
+        uniq: list[str] = []
+        seen2: set[str] = set()
+        for c in candidates:
+            if c not in seen2:
+                uniq.append(c)
+                seen2.add(c)
+        return uniq
+
+    def auto_discover_cline_config(self):
+        paths = self._candidate_cline_config_paths()
+        if not paths:
+            messagebox.showinfo("Auto Discover", "No Cline config file found in common locations.")
+            return
+        # Choose the first candidate
+        path = paths[0]
+        self.cline_cfg_var.set(path)
+        # Apply immediately to shim and persist
+        try:
+            shim.set_cline_config_path(path)
+        except Exception:
+            pass
+        self._save_config({
+            "upstream": self.lmstudio_var.get().strip(),
+            "cline_config_path": self.cline_cfg_var.get().strip(),
+            "host": self.host_var.get().strip() or "127.0.0.1",
+            "port": int(self.port_var.get().strip() or 8088),
+            "cf_streaming": self.cf_stream_enabled,
+            "gpt_oss_mode": self.gptoss_enabled,
+        })
+        messagebox.showinfo("Auto Discover", f"Detected Cline config:\n{path}")
 
     def _load_logos(self):
         """Load and scale logos. Returns (cf_img, lm_img) PhotoImage or (None, None)."""
@@ -287,6 +421,9 @@ class ShimGUI(tk.Tk):
     def _cf_btn_text(self) -> str:
         return "Disable Cloudflare Streaming" if self.cf_stream_enabled else "Enable Cloudflare Streaming"
 
+    def _gptoss_btn_text(self) -> str:
+        return "Disable GPT-OSS Mode" if self.gptoss_enabled else "Enable GPT-OSS Mode"
+
     def toggle_cf_streaming(self):
         self.cf_stream_enabled = not self.cf_stream_enabled
         try:
@@ -297,9 +434,27 @@ class ShimGUI(tk.Tk):
         # Persist immediately
         self._save_config({
             "upstream": self.lmstudio_var.get().strip(),
+            "cline_config_path": self.cline_cfg_var.get().strip(),
             "host": self.host_var.get().strip() or "127.0.0.1",
             "port": int(self.port_var.get().strip() or 8088),
             "cf_streaming": self.cf_stream_enabled,
+            "gpt_oss_mode": self.gptoss_enabled,
+        })
+
+    def toggle_gptoss_mode(self):
+        self.gptoss_enabled = not self.gptoss_enabled
+        try:
+            shim.set_gpt_oss_mode_default(self.gptoss_enabled)
+        except Exception:
+            pass
+        self.gptoss_btn.configure(text=self._gptoss_btn_text())
+        self._save_config({
+            "upstream": self.lmstudio_var.get().strip(),
+            "cline_config_path": self.cline_cfg_var.get().strip(),
+            "host": self.host_var.get().strip() or "127.0.0.1",
+            "port": int(self.port_var.get().strip() or 8088),
+            "cf_streaming": self.cf_stream_enabled,
+            "gpt_oss_mode": self.gptoss_enabled,
         })
 
     def start_server(self):
@@ -321,10 +476,18 @@ class ShimGUI(tk.Tk):
         # Persist settings
         self._save_config({
             "upstream": base_raw,
+            "cline_config_path": self.cline_cfg_var.get().strip(),
             "host": host,
             "port": port,
             "cf_streaming": self.cf_stream_enabled,
+            "gpt_oss_mode": self.gptoss_enabled,
         })
+
+        # Apply Cline config path
+        try:
+            shim.set_cline_config_path(self.cline_cfg_var.get().strip() or None)
+        except Exception:
+            pass
 
         self.controller.start(host, port)
         self.status_var.set(f"Running at http://{host}:{port} (upstream {normalized})")

@@ -1,6 +1,8 @@
 {
   "upstream": "z2g4-lmstudio.technologies-ai.com",
+  "cline_config_path": "C:\\Users\\imitr\\AppData\\Roaming\\Code\\User\\globalStorage\\saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json",
   "host": "127.0.0.1",
   "port": 8088,
-  "cf_streaming": true
+  "cf_streaming": true,
+  "gpt_oss_mode": false
 }
