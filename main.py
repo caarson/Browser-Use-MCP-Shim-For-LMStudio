@@ -1,5 +1,6 @@
 import argparse
 import sys
+import os
 
 
 def main():
@@ -16,6 +17,13 @@ def main():
     # If no arguments given at all, default to GUI for user convenience
     if (len(sys.argv) == 1) or args.gui:
         if not args.no_gui:  # allow override
+            # On Windows, set AppUserModelID before any windows are created to ensure taskbar icon grouping
+            if os.name == 'nt':
+                try:
+                    import ctypes  # type: ignore
+                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ClineShim.ShimServer")
+                except Exception:
+                    pass
             import shim_gui
             init_state = None
             if args.cf_streaming is not None:

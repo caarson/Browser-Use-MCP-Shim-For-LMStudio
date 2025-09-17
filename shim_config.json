@@ -4,5 +4,5 @@
   "host": "127.0.0.1",
   "port": 8088,
   "cf_streaming": true,
-  "gpt_oss_mode": false
+  "gpt_oss_mode": true
 }

@@ -12,6 +12,7 @@ from tkinter import scrolledtext
 import subprocess
 import re
 import time
+import requests
 try:
     import psutil  # type: ignore  # Optional: used for port/process management
 except Exception:
@@ -32,6 +33,8 @@ class ServerController:
         self.thread: Optional[threading.Thread] = None
         self.server: Optional[uvicorn.Server] = None
         self._running = False
+        self._host: Optional[str] = None
+        self._port: Optional[int] = None
 
     def start(self, host: str, port: int):
         if self._running:
@@ -39,6 +42,7 @@ class ServerController:
         # Disable uvicorn's default logging config in frozen apps to avoid isatty-related formatter failures
         config = uvicorn.Config(shim.app, host=host, port=port, log_level="info", log_config=None)
         self.server = uvicorn.Server(config)
+        self._host, self._port = host, port
 
         def run():
             self._running = True
@@ -52,7 +56,19 @@ class ServerController:
 
     def stop(self):
         if self.server and self._running:
-            self.server.should_exit = True
+            try:
+                # Request graceful shutdown
+                self.server.should_exit = True
+                # Force exit as a fallback if loop is stuck
+                setattr(self.server, 'force_exit', True)
+            except Exception:
+                pass
+            # Nudge the server with a quick health request to wake the loop
+            try:
+                if self._host and self._port:
+                    requests.get(f"http://{self._host}:{self._port}/health", timeout=0.2)
+            except Exception:
+                pass
         if self.thread:
             self.thread.join(timeout=5)
         self._running = False
@@ -102,6 +118,12 @@ class ShimGUI(tk.Tk):
 
         # Apply theme first
         self._apply_vs_theme()
+
+        # Set application icon from Shim PNG (best-effort)
+        try:
+            self._set_window_icon()
+        except Exception:
+            pass
 
         self._build_widgets()
         self._update_status()
@@ -251,10 +273,98 @@ class ShimGUI(tk.Tk):
         # Quit at bottom
         bottom = ttk.Frame(root, style='VS.TFrame')
         bottom.grid(row=2, column=0, sticky='we')
-        ttk.Button(bottom, text='Quit', style='VS.TButton', command=self.on_quit).pack(pady=8)
+        # Bottom-right Shim icon (small)
+        shim_small_img = self._load_shim_icon(small=True)
+        if shim_small_img is not None:
+            # Keep a reference to prevent garbage collection
+            self.bottom_shim_icon_img = shim_small_img
+            ttk.Label(bottom, image=shim_small_img, style='VS.TLabel').pack(side=tk.RIGHT, padx=8, pady=6)
+        # Quit button on the left
+        ttk.Button(bottom, text='Quit', style='VS.TButton', command=self.on_quit).pack(side=tk.LEFT, pady=8, padx=8)
 
         # After widgets exist, hook logging to GUI
         self._setup_logging_to_gui()
+
+    def _set_window_icon(self):
+        """Set the window icon from the Shim PNG and, on Windows, also set a .ico for taskbar."""
+        # Try preferred PNG, then fall back to any available shim icon PNG
+        preferred = resource_path(os.path.join('images', 'logos', 'ShimIcon(200x200px).png'))
+        fallbacks = [
+            preferred,
+            resource_path(os.path.join('images', 'logos', 'LMStudioHelperCharacter(1296x912px).png')),
+            resource_path(os.path.join('images', 'logos', 'CloudflareLogo(2560x846px).png')),
+        ]
+        png_path = next((p for p in fallbacks if os.path.exists(p)), None)
+        if png_path:
+            try:
+                img = tk.PhotoImage(file=png_path)
+                self.window_icon_img = img  # keep reference
+                self.iconphoto(True, img)
+            except Exception:
+                pass
+        # Improve Windows taskbar icon by supplying an .ico via iconbitmap
+        if os.name == 'nt':
+            try:
+                # Set an explicit AppUserModelID to avoid grouping under python.exe
+                import ctypes  # type: ignore
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ClineShim.ShimServer")
+            except Exception:
+                pass
+            try:
+                ico_path = resource_path(os.path.join('images', 'logos', 'ShimIcon.ico'))
+                if png_path and not os.path.exists(ico_path) and os.path.exists(png_path):
+                    self._ensure_ico_from_png(png_path, ico_path)
+                if os.path.exists(ico_path):
+                    self.iconbitmap(default=ico_path)
+            except Exception:
+                pass
+
+    def _ensure_ico_from_png(self, png_path: str, ico_path: str) -> None:
+        """Create a minimal .ico file by embedding the PNG (Vista+ supports PNG-in-ICO)."""
+        try:
+            if not os.path.exists(png_path):
+                return
+            os.makedirs(os.path.dirname(ico_path), exist_ok=True)
+            if os.path.exists(ico_path):
+                return
+            with open(png_path, 'rb') as f:
+                png = f.read()
+            # PNG header check
+            if png[:8] != b'\x89PNG\r\n\x1a\n':
+                return
+            # Extract width/height from IHDR
+            width = int.from_bytes(png[16:20], 'big')
+            height = int.from_bytes(png[20:24], 'big')
+            import struct
+            header = struct.pack('<HHH', 0, 1, 1)
+            w8 = width if 0 < width < 256 else 0
+            h8 = height if 0 < height < 256 else 0
+            entry = struct.pack('<BBBBHHII', w8, h8, 0, 0, 1, 32, len(png), 6 + 16)
+            with open(ico_path, 'wb') as f:
+                f.write(header)
+                f.write(entry)
+                f.write(png)
+        except Exception:
+            pass
+
+    def _load_shim_icon(self, small: bool = False):
+        """Load the Shim icon as a PhotoImage. If small=True, downscale to ~26-30px width."""
+        try:
+            candidates = [
+                resource_path(os.path.join('images', 'logos', 'ShimIcon(200x200px).png')),
+                resource_path(os.path.join('images', 'logos', 'LMStudioHelperCharacter(1296x912px).png')),
+                resource_path(os.path.join('images', 'logos', 'CloudflareLogo(2560x846px).png')),
+            ]
+            icon_path = next((p for p in candidates if os.path.exists(p)), None)
+            if not icon_path:
+                return None
+            img = tk.PhotoImage(file=icon_path)
+            if small:
+                factor = max(1, int(img.width() / 26))
+                img = img.subsample(factor, factor)
+            return img
+        except Exception:
+            return None
 
     # ------------- Auto discovery for Cline config -------------
     def _candidate_cline_config_paths(self) -> list[str]:
@@ -412,11 +522,13 @@ class ShimGUI(tk.Tk):
         handler = TextHandler(self.log_text)
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
 
-        # Attach to root and key loggers
+        # Attach to root and key loggers (avoid duplicate handlers)
         for name in ('', 'uvicorn', 'uvicorn.error', 'uvicorn.access', 'lmstudio_shim'):
             lg = logging.getLogger(name)
             lg.setLevel(logging.INFO)
-            lg.addHandler(handler)
+            already = any(isinstance(h, type(handler)) for h in lg.handlers)
+            if not already:
+                lg.addHandler(handler)
 
     def _cf_btn_text(self) -> str:
         return "Disable Cloudflare Streaming" if self.cf_stream_enabled else "Enable Cloudflare Streaming"
@@ -734,7 +846,19 @@ class ShimGUI(tk.Tk):
             if not messagebox.askyesno("Quit", "Server is running. Stop and quit?"):
                 return
             self.controller.stop()
-        self.destroy()
+        try:
+            # Close the window and end the Tk loop
+            self.destroy()
+        finally:
+            # As a last resort, if the loop is stuck, force-exit the process after a short delay
+            def _force_exit():
+                try:
+                    self.quit()
+                except Exception:
+                    pass
+                os._exit(0)
+            # Schedule the fallback; if destroy() worked, this will have no effect
+            self.after(250, _force_exit)
 
     # ---------------- Persistence Helpers -----------------
     def _load_config(self):

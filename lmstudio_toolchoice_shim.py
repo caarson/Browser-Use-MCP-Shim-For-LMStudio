@@ -32,6 +32,97 @@ except Exception:
 # Optionally strip reasoning tags like <think>...</think> from final content (default: keep)
 SHIM_STRIP_THINK: bool = os.getenv("SHIM_STRIP_THINK", "0").lower() in ("1", "true", "on", "yes")
 
+# Cache recently used model ids to surface in /models, in case upstream doesn't list them
+RECENT_MODEL_IDS: Set[str] = set()
+# Cache observed loaded context lengths per model (from chat responses)
+LOADED_CONTEXT_LENGTHS: Dict[str, int] = {}
+
+# Optional per-model context overrides loaded from shim_config.json
+_CTX_OVERRIDES_CACHE: Dict[str, Any] = {"mtime": 0.0, "last": 0.0, "map": {}}
+CTX_OVERRIDES_TTL: float = 2.0
+
+def _shim_config_path() -> str:
+    try:
+        return os.path.join(os.path.dirname(__file__), "shim_config.json")
+    except Exception:
+        return "shim_config.json"
+
+def _load_context_overrides_if_needed() -> Dict[str, Dict[str, int]]:
+    """Read context overrides from shim_config.json with TTL + mtime caching.
+
+    Supported JSON shapes inside shim_config.json:
+      {
+        "context_overrides": {
+          "model-id": {"loaded_context_length": 32768, "max_context_length": 131072},
+          "another-id": 24576  # shorthand for loaded_context_length
+        }
+      }
+      or legacy key "model_context_overrides" with the same shape.
+    """
+    path = _shim_config_path()
+    try:
+        st = os.stat(path)
+        mtime = st.st_mtime
+    except Exception:
+        return _CTX_OVERRIDES_CACHE.get("map", {})  # no file
+    now = time.time()
+    if _CTX_OVERRIDES_CACHE.get("mtime") == mtime and (now - _CTX_OVERRIDES_CACHE.get("last", 0.0)) < CTX_OVERRIDES_TTL:
+        return _CTX_OVERRIDES_CACHE.get("map", {})
+    overrides: Dict[str, Dict[str, int]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("context_overrides") or data.get("model_context_overrides") or {}
+        if isinstance(raw, dict):
+            for mid, spec in raw.items():
+                try:
+                    if isinstance(spec, (int, float)):
+                        overrides[str(mid)] = {"loaded_context_length": int(spec)}
+                    elif isinstance(spec, dict):
+                        out: Dict[str, int] = {}
+                        # Accept multiple aliases
+                        for k_src, k_dst in (
+                            ("loaded_context_length", "loaded_context_length"),
+                            ("loaded_context", "loaded_context_length"),
+                            ("current_context_length", "loaded_context_length"),
+                            ("max_context_length", "max_context_length"),
+                            ("max", "max_context_length"),
+                        ):
+                            v = spec.get(k_src)
+                            if isinstance(v, (int, float)) and v > 0:
+                                out[k_dst] = int(v)
+                        if out:
+                            overrides[str(mid)] = out
+                except Exception:
+                    continue
+        _CTX_OVERRIDES_CACHE.update({"mtime": mtime, "last": now, "map": overrides})
+        if overrides:
+            try:
+                logger.info("[cfg] context overrides loaded for: %s", list(overrides.keys())[:6])
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            logger.warning(f"Failed to load context_overrides: {e}")
+        except Exception:
+            pass
+    return overrides
+
+def _apply_overrides(mid: str, max_ctx: Optional[int], loaded_ctx: Optional[int]) -> Tuple[Optional[int], Optional[int]]:
+    """Apply configured overrides for a model id, if present."""
+    ov = _load_context_overrides_if_needed().get(str(mid)) or {}
+    if isinstance(ov, dict):
+        if isinstance(ov.get("max_context_length"), int) and ov["max_context_length"] > 0:
+            max_ctx = ov["max_context_length"]
+        if isinstance(ov.get("loaded_context_length"), int) and ov["loaded_context_length"] > 0:
+            loaded_ctx = ov["loaded_context_length"]
+            # keep cache in sync for downstream calls
+            try:
+                LOADED_CONTEXT_LENGTHS[str(mid)] = int(loaded_ctx)
+            except Exception:
+                pass
+    return max_ctx, loaded_ctx
+
 def set_lmstudio_base(base_url: str) -> str:
     """Update the base URL used to reach the upstream LM Studio server.
 
@@ -100,6 +191,28 @@ def _parse_type_name(tname: str) -> Optional[type]:
         "boolean": bool,
         "object": dict,
     }.get(t, None)
+
+def _get_loaded_ctx_from_detail(mid: str) -> Optional[int]:
+    """Try to fetch loaded context length for a model via REST detail endpoint.
+    Checks common keys and caches on success.
+    """
+    try:
+        resp = _proxy("GET", f"/api/v0/models/{mid}")
+        try:
+            j = json.loads(resp.body.decode("utf-8", "ignore"))
+        except Exception:
+            return None
+        if not isinstance(j, dict):
+            return None
+        # Prioritized keys we might see from LM Studio variants
+        for k in ("loaded_context_length", "context_length", "loaded_context", "current_context_length"):
+            v = j.get(k)
+            if isinstance(v, int) and v > 0:
+                LOADED_CONTEXT_LENGTHS[mid] = v
+                return v
+        return None
+    except Exception:
+        return None
 
 def _load_mcp_discovery_if_needed() -> Tuple[set, Dict[str, Dict[str, Optional[type]]], Dict[str, str]]:
     """Load MCP tool names, schemas, aliases from a configured file, with TTL and mtime check.
@@ -543,7 +656,18 @@ def _call_upstream_chat(body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[
     except Exception as e:
         return None, f"Upstream error: {e}"
     try:
-        return resp.json(), None
+        data = resp.json()
+        # Cache loaded context length if LM Studio returns it in model_info
+        try:
+            mid = data.get("model") or body.get("model")
+            mi = data.get("model_info")
+            if isinstance(mid, str) and isinstance(mi, dict):
+                cl = mi.get("context_length")
+                if isinstance(cl, int) and cl > 0:
+                    LOADED_CONTEXT_LENGTHS[mid] = cl
+        except Exception:
+            pass
+        return data, None
     except Exception as e:
         return None, f"Invalid upstream JSON: {e}"
 
@@ -580,18 +704,38 @@ def _massage_chat_payload(payload: Dict[str, Any], force_stream: Optional[bool] 
     return payload
 
 def _normalize_path(in_path: str) -> str:
+    """Normalize only the OpenAI-compatible paths to /v1/*.
+
+    Important: Do NOT rewrite /api/v0/* here — those should be sent to the upstream REST base (not /v1).
+    This function returns a path starting with 'v1/' for OpenAI routes; otherwise returns the input sans leading '/'.
+    """
     rel = in_path.lstrip("/")
+    if rel.startswith("api/v0/"):
+        # Preserve REST path for caller to handle specially in _proxy
+        return rel
     # Accept bare chat/completions or with v1/
     if rel.startswith("v1/"):
         rel = rel[3:]
-    # Ensure we only ever forward paths under v1
     return f"v1/{rel}" if not rel.startswith("v1/") else rel
 
 def _proxy(method: str, path: str, body: Any = None, headers: Dict[str, str] = None) -> Response:
-    norm = _normalize_path(path)
-    # Build final upstream URL (LMSTUDIO_BASE already ends with /v1)
-    suffix = norm[3:] if norm.startswith("v1/") else norm
-    url = urljoin(LMSTUDIO_BASE.rstrip("/") + "/", suffix.lstrip("/"))
+    """Proxy a request to upstream.
+
+    - For /api/v0/*: send to the upstream base ROOT (strip trailing /v1 from LMSTUDIO_BASE) and preserve path.
+    - For others: map to /v1/* under LMSTUDIO_BASE (OpenAI-compatible API).
+    """
+    rel = path.lstrip("/")
+    if rel.startswith("api/v0/"):
+        # Compute root by stripping trailing /v1 if present
+        base_root = LMSTUDIO_BASE
+        if base_root.endswith("/v1"):
+            base_root = base_root[:-3]
+        url = urljoin(base_root.rstrip("/") + "/", rel)
+        norm = rel  # for logging
+    else:
+        norm = _normalize_path(path)
+        suffix = norm[3:] if norm.startswith("v1/") else norm
+        url = urljoin(LMSTUDIO_BASE.rstrip("/") + "/", suffix.lstrip("/"))
     # Preserve auth / cookie headers, normalize others
     out_headers: Dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
     if headers:
@@ -984,11 +1128,318 @@ def _stitch_streaming_chat_completion(payload: Dict[str, Any], headers: Dict[str
 
 @app.get("/v1/models")
 def models():
-    return _proxy("GET", "/v1/models")
+    # Fetch upstream list first
+    resp = _proxy("GET", "/v1/models")
+    try:
+        data = json.loads(resp.body.decode("utf-8", "ignore"))
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            enriched = []
+            for m in data["data"]:
+                # Preserve original fields and enrich with conservative context metadata for Cline
+                if isinstance(m, dict):
+                    mm = dict(m)
+                    # Provide minimal metadata that many clients expect
+                    # Use reasonable defaults if upstream doesn't provide them
+                    usage = mm.get("usage", {})
+                    if not isinstance(usage, dict):
+                        usage = {}
+                    # If vendor info missing, set owner-like field
+                    mm.setdefault("owned_by", mm.get("owned_by", "organization_owner"))
+                    # Attach a conservative context window hint; LM Studio often supports large windows
+                    # If your backend exposes exact numbers, you can map them here.
+                    # Provide multiple common shapes various clients read
+                    # Compute a baseline then apply any overrides so clients see accurate numbers
+                    base_total = 131072
+                    try:
+                        # Attempt to reuse vendor hints if present
+                        if isinstance(mm.get("context_window"), dict) and isinstance(mm["context_window"].get("total"), int):
+                            base_total = int(mm["context_window"]["total"])  # type: ignore[index]
+                        elif isinstance(mm.get("max_context_window"), int):
+                            base_total = int(mm["max_context_window"])  # type: ignore[assignment]
+                        elif isinstance((mm.get("tokens") or {}).get("context"), int):
+                            base_total = int((mm.get("tokens") or {}).get("context"))  # type: ignore[assignment]
+                        elif isinstance(mm.get("context_window_total"), int):
+                            base_total = int(mm.get("context_window_total"))  # type: ignore[assignment]
+                    except Exception:
+                        base_total = 131072
+                    mid = mm.get("id") or mm.get("model") or mm.get("name") or "unknown"
+                    max_ctx, _ = _apply_overrides(str(mid), base_total, None)
+                    if "context_window" not in mm:
+                        mm["context_window"] = {"total": int(max_ctx or base_total)}
+                    mm.setdefault("max_context_window", int(max_ctx or base_total))
+                    mm.setdefault("tokens", {"context": int(max_ctx or base_total)})
+                    mm.setdefault("context_window_total", int(max_ctx or base_total))
+                    enriched.append(mm)
+                else:
+                    enriched.append(m)
+            data["data"] = enriched
+            return JSONResponse(status_code=200, content=data)
+    except Exception:
+        pass
+    return resp
+
+@app.get("/models")
+def models_plain():
+    """
+    LM Studio-style models endpoint used by Cline's LM Studio provider UI.
+    It expects a shape like: { "values": [ "{...modelJson...}", ... ] }
+
+    We try to proxy upstream /models first. If that isn't available, we
+    synthesize the structure from the OpenAI-compatible /v1/models response.
+    """
+    # Try direct upstream passthrough first (some LM Studio builds expose this)
+    upstream_try = _proxy("GET", "/models")
+    try:
+        raw = upstream_try.body.decode("utf-8", "ignore")
+        j = json.loads(raw)
+        if isinstance(j, dict) and isinstance(j.get("values"), list):
+            try:
+                logger.info(f"/models passthrough: upstream values={len(j['values'])}")
+            except Exception:
+                pass
+            return JSONResponse(status_code=upstream_try.status_code, content=j)
+    except Exception:
+        # fall back to synthesize below
+        pass
+
+    # Fallback: build from /v1/models list
+    fallback_resp = _proxy("GET", "/v1/models")
+    try:
+        data = json.loads(fallback_resp.body.decode("utf-8", "ignore"))
+        values = []
+        # Start with any recent model ids we saw in chat requests
+        recent_ids = list(RECENT_MODEL_IDS)
+        recent_ids_set = set(recent_ids)
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for m in data["data"]:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id") or m.get("model") or m.get("name") or "unknown"
+                recent_ids_set.add(str(mid))
+                # Extract any known context hints, else default conservatively
+                ctx = (
+                    (m.get("context_window") or {}).get("total")
+                    if isinstance(m.get("context_window"), dict)
+                    else None
+                )
+                if ctx is None:
+                    # Try common alternates we may have set in /v1/models enrichment
+                    ctx = (
+                        m.get("max_context_window")
+                        or (m.get("tokens") or {}).get("context")
+                        or m.get("context_window_total")
+                    )
+                # Final default if still unknown
+                if not isinstance(ctx, int):
+                    ctx = 131072
+                # Prefer observed loaded context length if available
+                cached_loaded = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                if not isinstance(cached_loaded, int):
+                    cached_loaded = _get_loaded_ctx_from_detail(str(mid))
+                loaded_ctx = int(cached_loaded) if isinstance(cached_loaded, int) else int(ctx)
+                # Apply overrides if configured
+                ctx, loaded_ctx = _apply_overrides(str(mid), ctx, loaded_ctx)
+                lm_entry = {
+                    "id": str(mid),
+                    "max_context_length": int(ctx),
+                    "loaded_context_length": loaded_ctx,
+                }
+                values.append(json.dumps(lm_entry))
+        # Include recent model ids that may not appear in upstream list
+        if not values and recent_ids:
+            for mid in recent_ids:
+                ctx = 131072
+                cached_loaded = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                if not isinstance(cached_loaded, int):
+                    cached_loaded = _get_loaded_ctx_from_detail(str(mid))
+                loaded_ctx = int(cached_loaded) if isinstance(cached_loaded, int) else ctx
+                ctx, loaded_ctx = _apply_overrides(str(mid), ctx, loaded_ctx)
+                values.append(json.dumps({"id": str(mid), "max_context_length": ctx, "loaded_context_length": loaded_ctx}))
+        # As a last resort, include a couple of sensible placeholders so the UI isn't empty
+        if not values:
+            for mid in ("openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+                ctx = 131072
+                cached_loaded = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                if not isinstance(cached_loaded, int):
+                    cached_loaded = _get_loaded_ctx_from_detail(str(mid))
+                loaded_ctx = int(cached_loaded) if isinstance(cached_loaded, int) else ctx
+                ctx, loaded_ctx = _apply_overrides(str(mid), ctx, loaded_ctx)
+                values.append(json.dumps({"id": mid, "max_context_length": ctx, "loaded_context_length": loaded_ctx}))
+        # If no models found, still return an empty values array
+        try:
+            logger.info(
+                "/models synthesize: values=%d recent_ids=%d (fallback from /v1/models)",
+                len(values), len(recent_ids)
+            )
+        except Exception:
+            pass
+        return JSONResponse(status_code=200, content={"values": values})
+    except Exception:
+        # As a last resort, surface the upstream status and a sane empty response
+        try:
+            try:
+                logger.warning("/models synthesize failed, returning empty values with status=%s", str(fallback_resp.status_code))
+            except Exception:
+                pass
+            return JSONResponse(status_code=fallback_resp.status_code, content={"values": []})
+        except Exception:
+            try:
+                logger.warning("/models synthesize failed, upstream status unavailable; returning empty values")
+            except Exception:
+                pass
+            return JSONResponse(status_code=200, content={"values": []})
+
+def _synthesize_models_list_for_rest() -> list:
+    """Build a list of REST-style model dicts with context info.
+
+    Target shape per item:
+      { id, object: 'model', max_context_length: int, loaded_context_length: int, state: 'loaded'|'not-loaded' }
+    """
+    # 1) Try upstream REST first, if present
+    upstream = _proxy("GET", "/api/v0/models")
+    try:
+        raw = upstream.body.decode("utf-8", "ignore")
+        j = json.loads(raw)
+        if isinstance(j, dict) and isinstance(j.get("data"), list):
+            out = []
+            for m in j["data"]:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id") or m.get("model") or m.get("name")
+                if not mid:
+                    continue
+                ctx = m.get("max_context_length")
+                if not isinstance(ctx, int):
+                    # fallback: try other common hints
+                    ctx = (
+                        (m.get("context_window") or {}).get("total") if isinstance(m.get("context_window"), dict) else None
+                    ) or m.get("max_context_window") or (m.get("tokens") or {}).get("context") or m.get("context_window_total")
+                if not isinstance(ctx, int):
+                    ctx = 131072
+                loaded_ctx = m.get("loaded_context_length")
+                if not isinstance(loaded_ctx, int):
+                    cached = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                    if not isinstance(cached, int):
+                        cached = _get_loaded_ctx_from_detail(str(mid))
+                    loaded_ctx = int(cached) if isinstance(cached, int) else int(ctx)
+                # Apply overrides if any
+                ctx, loaded_ctx = _apply_overrides(str(mid), ctx, loaded_ctx)
+                state = m.get("state") or ("loaded" if str(mid) in RECENT_MODEL_IDS else "not-loaded")
+                out.append({
+                    "id": str(mid),
+                    "object": "model",
+                    "max_context_length": int(ctx),
+                    "loaded_context_length": int(loaded_ctx),
+                    "state": state,
+                })
+            try:
+                logger.info("/api/v0/models passthrough: items=%d", len(out))
+            except Exception:
+                pass
+            return out
+    except Exception:
+        pass
+
+    # 2) Fallback: synthesize from OpenAI-style /v1/models enrichment
+    fallback = _proxy("GET", "/v1/models")
+    out = []
+    recent = set(RECENT_MODEL_IDS)
+    try:
+        data = json.loads(fallback.body.decode("utf-8", "ignore"))
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for m in data["data"]:
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id") or m.get("model") or m.get("name")
+                if not mid:
+                    continue
+                ctx = (
+                    (m.get("context_window") or {}).get("total") if isinstance(m.get("context_window"), dict) else None
+                ) or m.get("max_context_window") or (m.get("tokens") or {}).get("context") or m.get("context_window_total")
+                if not isinstance(ctx, int):
+                    ctx = 131072
+                cached = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                if not isinstance(cached, int):
+                    cached = _get_loaded_ctx_from_detail(str(mid))
+                loaded_ctx = int(cached) if isinstance(cached, int) else int(ctx)
+                ctx, loaded_ctx = _apply_overrides(str(mid), ctx, loaded_ctx)
+                out.append({
+                    "id": str(mid),
+                    "object": "model",
+                    "max_context_length": int(ctx),
+                    "loaded_context_length": int(loaded_ctx),
+                    "state": "loaded" if str(mid) in recent else "not-loaded",
+                })
+        # Ensure we include recent model IDs even if upstream omitted them
+        listed_ids = {item["id"] for item in out}
+        for mid in recent:
+            if mid not in listed_ids:
+                cached = LOADED_CONTEXT_LENGTHS.get(str(mid))
+                if not isinstance(cached, int):
+                    cached = _get_loaded_ctx_from_detail(str(mid))
+                loaded_ctx = int(cached) if isinstance(cached, int) else 131072
+                _, loaded_ctx = _apply_overrides(str(mid), None, loaded_ctx)
+                out.append({
+                    "id": str(mid),
+                    "object": "model",
+                    "max_context_length": 131072,
+                    "loaded_context_length": loaded_ctx,
+                    "state": "loaded",
+                })
+    except Exception:
+        pass
+    if not out:
+        # Provide a minimal placeholder set so the UI has something to render
+        out = [{
+            "id": mid,
+            "object": "model",
+            "max_context_length": 131072,
+            "loaded_context_length": 131072,
+            "state": "not-loaded",
+        } for mid in ("openai/gpt-oss-20b", "openai/gpt-oss-120b")]
+    try:
+        logger.info("/api/v0/models synthesize: items=%d recent=%d", len(out), len(RECENT_MODEL_IDS))
+    except Exception:
+        pass
+    return out
+
+@app.get("/api/v0/models")
+def models_api_v0():
+    """LM Studio REST-style models list: {object:'list', data:[...]}"""
+    items = _synthesize_models_list_for_rest()
+    return JSONResponse(status_code=200, content={"object": "list", "data": items})
+
+@app.get("/api/v0/models/{model_id}")
+def model_api_v0_detail(model_id: str):
+    """LM Studio REST-style single model detail."""
+    items = _synthesize_models_list_for_rest()
+    for it in items:
+        if it.get("id") == model_id:
+            # Ensure overrides are reflected even if cached list is slightly stale
+            max_c = it.get("max_context_length") if isinstance(it.get("max_context_length"), int) else None
+            loaded_c = it.get("loaded_context_length") if isinstance(it.get("loaded_context_length"), int) else None
+            max_c, loaded_c = _apply_overrides(model_id, max_c, loaded_c)
+            it["max_context_length"] = int(max_c or it.get("max_context_length") or 131072)
+            it["loaded_context_length"] = int(loaded_c or it.get("loaded_context_length") or it.get("max_context_length") or 131072)
+            return JSONResponse(status_code=200, content=it)
+    # If not found, return a minimal placeholder with defaults
+    return JSONResponse(status_code=200, content={
+        "id": model_id,
+        "object": "model",
+        "max_context_length": 131072,
+        "loaded_context_length": 131072,
+        "state": "not-loaded",
+    })
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     payload = await req.json()
+    try:
+        mid = payload.get("model")
+        if isinstance(mid, str) and mid:
+            RECENT_MODEL_IDS.add(mid)
+    except Exception:
+        pass
     headers = {k: v for k, v in req.headers.items()}
     # Resolve GPT-OSS mode for this request via header, else default
     gptoss_hdr = headers.get("X-GPT-OSS-MODE")
